@@ -24,7 +24,11 @@
     "ci:stylelint": "pnpm -r --parallel --workspace-concurrency=0 stylelint",
     "ci:test": "pnpm -r --parallel --workspace-concurrency=0 test:ci && pnpm test:scripts",
     "test:scripts": "node .scripts/compare-database.test.js",
-    "test:integration": "./.scripts/integration/run.sh"
+    "test:integration": "./.scripts/integration/run.sh",
+    "format:diff": "git diff HEAD --name-only --diff-filter=d -z | xargs -0 -r -- prettier --write --ignore-unknown --no-error-on-unmatched-pattern",
+    "format:others": "git ls-files --others --exclude-standard | xargs -r -- prettier --write --ignore-unknown --no-error-on-unmatched-pattern",
+    "format:all": "prettier --write . --ignore-unknown",
+    "format": "npm run format:diff && npm run format:others"
   },
   "devDependencies": {
     "@changesets/cli": "^2.27.6",

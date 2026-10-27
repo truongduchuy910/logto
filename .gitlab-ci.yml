@@ -1,0 +1,78 @@
+# Builds the Logto image from the root Dockerfile and pushes it to Harbor as
+# harbor.ocopee.com/ocopee/logto. Mirrors the upstream `dockerize-edge` job in
+# .github/workflows/release.yml (single amd64 build, no build args); upstream
+# tests, npm publishing and release steps are intentionally left out.
+#
+# Docker runs as a docker-in-docker service. DOCKER_HOST points the CLI at it
+# and DOCKER_TLS_CERTDIR is cleared so the daemon listens on plain TCP 2375.
+# https://docs.gitlab.com/ci/docker/using_docker_build/#use-docker-in-docker
+#
+# HARBOR_USER and HARBOR_PASSWORD are masked CI/CD variables set in
+# Settings > CI/CD > Variables.
+stages:
+  - build
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+build:
+  stage: build
+  image: docker:27-cli
+  # A newer pipeline on the same ref cancels this job. Only takes effect when
+  # "Auto-cancel redundant pipelines" is on in Settings > CI/CD > General.
+  # https://docs.gitlab.com/ci/yaml/#interruptible
+  interruptible: true
+  services:
+    - name: docker:27-dind
+      variables:
+        HEALTHCHECK_TCP_PORT: "2375"
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    HARBOR_REGISTRY: harbor.ocopee.com
+    HARBOR_PROJECT: ocopee
+    IMAGE: $HARBOR_REGISTRY/$HARBOR_PROJECT/logto
+    # Pinned regctl release and the sha256 of its regctl-linux-amd64 asset.
+    # https://github.com/regclient/regclient/releases
+    REGCTL_VERSION: v0.11.6
+    REGCTL_SHA256: 8e0e62a497fcdb8048d18aa927a139613176ba0531f412bc541044e28f9856bd
+    # Size of each upload request; S3-backed registries need at least 5MB.
+    REGCTL_BLOB_CHUNK: "20971520"
+  before_script:
+    - echo "$HARBOR_PASSWORD" | docker login $HARBOR_REGISTRY -u "$HARBOR_USER" --password-stdin
+    - wget -qO /usr/local/bin/regctl https://github.com/regclient/regclient/releases/download/$REGCTL_VERSION/regctl-linux-amd64
+    - echo "$REGCTL_SHA256  /usr/local/bin/regctl" | sha256sum -c -
+    - chmod +x /usr/local/bin/regctl
+    - echo "$HARBOR_PASSWORD" | regctl registry login $HARBOR_REGISTRY -u "$HARBOR_USER" --pass-stdin
+    # Push every blob above one chunk in chunk-sized requests.
+    - regctl registry set $HARBOR_REGISTRY --blob-chunk $REGCTL_BLOB_CHUNK --blob-max $REGCTL_BLOB_CHUNK
+    # The docker-in-docker daemon is fresh on every job, so nothing survives
+    # between pipelines. Import existing layer cache from Harbor and keep the
+    # docker-container buildx driver so registry cache export can be restored
+    # later; the default driver cannot export cache to a registry.
+    # https://docs.docker.com/build/cache/backends/registry/
+    - docker buildx create --use
+  script:
+    # BuildKit uploads each layer in a single request, and Traefik in front of
+    # Harbor cuts request bodies after 60s, so large layers fail with "blob
+    # upload invalid". Build to an OCI tar instead and let regctl push it in
+    # chunks, each a separate short request.
+    #
+    # Registry cache writes are temporarily disabled after Harbor upload
+    # failures (HTTP 499). TODO: Add this option back when uploads are reliable:
+    # --cache-to type=registry,ref=$IMAGE:buildcache,mode=max
+    - >
+      docker buildx build --platform linux/amd64
+      --cache-from type=registry,ref=$IMAGE:buildcache
+      --output type=oci,dest=logto.tar .
+    - regctl image import $IMAGE:$CI_COMMIT_SHORT_SHA logto.tar
+    # Same manifest, so only the tag is written; no blobs are uploaded again.
+    - regctl image copy $IMAGE:$CI_COMMIT_SHORT_SHA $IMAGE:latest
+  # Automatic on the default branch; manual on merge requests so a branch
+  # image can be pushed for testing when needed.
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - when: manual
+      allow_failure: true
